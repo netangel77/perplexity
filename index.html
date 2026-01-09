@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Perplexity Chat (Local GUI)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #fafafa; }
+    header { padding: 12px; background: #f0f0f0; display: grid; gap: 8px; }
+    input, select, button, textarea { font-size: 14px; }
+    #chat { padding: 16px; height: calc(100vh - 190px); overflow: auto; }
+    .msg { margin: 10px 0; padding: 12px; border-radius: 14px; max-width: 900px; white-space: pre-wrap; }
+    .user { background: #007aff; color: white; margin-left: auto; }
+    .ai { background: white; border: 1px solid #e6e6e6; }
+    footer { padding: 12px; background: white; border-top: 1px solid #eee; display: grid; gap: 8px; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    textarea { width: 100%; height: 64px; padding: 10px; border-radius: 10px; border: 1px solid #ddd; }
+    button { padding: 10px 16px; border: 0; border-radius: 10px; background: #007aff; color: white; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: default; }
+    .small { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <div class="small">API key (stored only in this browser tab):</div>
+      <input id="key" placeholder="pplx-..." />
+    </div>
+    <div>
+      <div class="small">Model:</div>
+      <select id="model">
+        <option value="sonar-small-online">sonar-small-online</option>
+        <option value="sonar">sonar</option>
+        <option value="sonar-pro">sonar-pro</option>
+      </select>
+    </div>
+  </header>
+
+  <div id="chat">
+    <div class="msg ai">Ready. Paste API key → ask a question.</div>
+  </div>
+
+  <footer>
+    <div class="row">
+      <textarea id="prompt" placeholder="Ask anything..."></textarea>
+      <button id="send">Send</button>
+    </div>
+    <div class="small" id="meta"></div>
+  </footer>
+
+<script>
+  const chat = document.getElementById('chat');
+  const keyEl = document.getElementById('key');
+  const modelEl = document.getElementById('model');
+  const promptEl = document.getElementById('prompt');
+  const sendBtn = document.getElementById('send');
+  const meta = document.getElementById('meta');
+
+  const messages = [];
+
+  function addMsg(role, content) {
+    const d = document.createElement('div');
+    d.className = 'msg ' + (role === 'user' ? 'user' : 'ai');
+    d.textContent = content;
+    chat.appendChild(d);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  async function send() {
+    const key = keyEl.value.trim();
+    const prompt = promptEl.value.trim();
+    const model = modelEl.value;
+
+    if (!key) { addMsg('ai', 'Paste API key first.'); return; }
+    if (!prompt) return;
+
+    messages.push({ role: 'user', content: prompt });
+    addMsg('user', prompt);
+    promptEl.value = '';
+    meta.textContent = '';
+    sendBtn.disabled = true;
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, model, messages })
+      });
+      const text = await res.text();
+      if (!res.ok) throw new Error(text);
+
+      const data = JSON.parse(text);
+      messages.push({ role: 'assistant', content: data.answer });
+      addMsg('assistant', data.answer);
+
+      if (data.citations && data.citations.length) {
+        meta.textContent = 'Citations: ' + data.citations.join(' | ');
+      } else if (data.usage) {
+        meta.textContent = 'Usage available in response.';
+      }
+    } catch (e) {
+      addMsg('assistant', 'Error: ' + e.message);
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+
+  sendBtn.onclick = send;
+  promptEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+</script>
+</body>
+</html>

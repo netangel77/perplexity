@@ -2,79 +2,156 @@ package main
 
 import (
 	"bytes"
+	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
-	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"time"
 )
+
+//go:embed index.html
+var indexHTML string
 
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type Request struct {
-	Model    string    `json:"model"`
+type ChatRequest struct {
+	Key      string    `json:"key"`
 	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
+	Model    string    `json:"model,omitempty"`
+}
+
+type pplxResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+	Citations []string `json:"citations,omitempty"`
+	Usage     any      `json:"usage,omitempty"`
 }
 
 func main() {
-	apiKey := os.Getenv("PPLX_API_KEY")
-	if apiKey == "" {
-		fmt.Println("Error: Set PPLX_API_KEY=pplx-... (full key)")
-		os.Exit(1)
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, indexHTML)
+	})
+
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+
+		req.Key = strings.TrimSpace(req.Key)
+		if req.Key == "" {
+			http.Error(w, "missing api key", http.StatusBadRequest)
+			return
+		}
+
+		model := strings.TrimSpace(req.Model)
+		if model == "" {
+			model = "sonar-small-online"
+		}
+
+		answer, citations, usage, err := callPerplexity(r.Context(), req.Key, model, req.Messages)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		resp := map[string]any{
+			"answer":    answer,
+			"citations": citations,
+			"usage":     usage,
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	srv := &http.Server{
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 60 * time.Second,
 	}
 
-	reqBody := Request{
-		Model: "sonar",
-		Messages: []Message{
-			{Role: "system", Content: "You are a helpful assistant."},
-			{Role: "user", Content: "What are the top AI trends in 2026?"},
-		},
-		Stream: false,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
+	// Bind to a free local port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		fmt.Printf("JSON error: %v\n", err)
-		os.Exit(1)
+		log.Fatal(err)
+	}
+	addr := "http://" + ln.Addr().String()
+
+	log.Printf("Perplexity GUI: %s\n", addr)
+	_ = openBrowser(addr) // if it fails, just open the printed URL manually
+
+	log.Fatal(srv.Serve(ln))
+}
+
+func callPerplexity(ctx context.Context, key, model string, messages []Message) (string, []string, any, error) {
+	apiReq := map[string]any{
+		"model":    model,
+		"messages": messages,
+		"stream":   false,
 	}
 
-	client := &http.Client{}
-	req, err := http.NewRequest("POST", "https://api.perplexity.ai/chat/completions", bytes.NewBuffer(jsonData))
-	if err != nil {
-		fmt.Printf("Request error: %v\n", err)
-		os.Exit(1)
-	}
+	body, _ := json.Marshal(apiReq)
 
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("X-Subscription-Token", apiKey) // Often required alongside Bearer
+	req, _ := http.NewRequestWithContext(ctx, "POST", "https://api.perplexity.ai/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("X-Subscription-Token", key)
 	req.Header.Set("Content-Type", "application/json")
 
+	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("HTTP error: %v\n", err)
-		os.Exit(1)
+		return "", nil, nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("Read error: %v\n", err)
-		os.Exit(1)
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		// Return body for easier debugging.
+		return "", nil, nil, fmt.Errorf("api error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	if resp.StatusCode != 200 {
-		fmt.Printf("❌ API Error %d: %s\n", resp.StatusCode, string(body))
-		fmt.Println("\n🔍 Debug tips:")
-		fmt.Println("  - Key format? Must start with 'pplx-' (check Settings > API)")
-		fmt.Println("  - Credits added? (Settings > API > Add credits)")
-		fmt.Println("  - Pro active? API needs Pro + credits")
-		os.Exit(1)
+	var pr pplxResponse
+	if err := json.Unmarshal(respBody, &pr); err != nil {
+		return "", nil, nil, fmt.Errorf("bad api json: %w", err)
 	}
+	if len(pr.Choices) == 0 {
+		return "", pr.Citations, pr.Usage, fmt.Errorf("empty response")
+	}
+	return pr.Choices[0].Message.Content, pr.Citations, pr.Usage, nil
+}
 
-	fmt.Println("✅ Success!")
-	fmt.Printf("Response: %s\n", string(body))
+func openBrowser(url string) error {
+	// Common approach: Windows uses "rundll32 url.dll,FileProtocolHandler <url>". [web:89][web:99]
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
 }
